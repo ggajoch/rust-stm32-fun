@@ -128,6 +128,11 @@ impl Buffer {
     }
 }
 
+pub struct CommandsBuffer {
+    buffer : Buffer,
+    cmds_in_buffer : u8,
+}
+
 
 trait Device {
     fn new() -> Self;
@@ -208,35 +213,83 @@ impl Device for Hardware {
 }
 
 static HARDWARE : Mutex<RefCell<Option<Hardware>>> = Mutex::new(RefCell::new(None));
-static RX_BUFFER : Mutex<RefCell<Option<Buffer>>> = Mutex::new(RefCell::new(None));
+static RX_BUFFER : Mutex<RefCell<Option<CommandsBuffer>>> = Mutex::new(RefCell::new(None));
 
 static mut ERROR: u8 = 0_u8;
 
 //#[entry]
 #[no_mangle]
 fn main() -> ! {
+    let mut _rx_buf : *mut CommandsBuffer = core::ptr::null_mut();
+
     cortex_m::interrupt::free(|cs| {
         let mut hw = Hardware::new();
         hw.led_toggle();
         hw.serial.write_str("Startup!\r\n");
         *HARDWARE.borrow(cs).borrow_mut() = Some(hw);
 
-        *RX_BUFFER.borrow(cs).borrow_mut() = Some(Buffer::new());
+        let mut rx_buf = CommandsBuffer{
+            buffer : Buffer::new(),
+            cmds_in_buffer : 0
+        };
+        _rx_buf = &mut rx_buf;
+
+        *RX_BUFFER.borrow(cs).borrow_mut() = Some(rx_buf);
     });
 
 
+
+    let mut buf = [0_u8; 30];
+    let mut iter = 0_usize;
+    let mut done = false;
+
     loop {
-        let mut data: Option<u8> = None;
-        let mut error_code: u8 = 0;
+        let mut tmp = [0_u8; 30];
+
 
         cortex_m::interrupt::free(|cs| {
             if let &mut Some(ref mut buffer) = RX_BUFFER.borrow(cs).borrow_mut().deref_mut() {
-                data = buffer.read();
-                unsafe {
-                    error_code = read_volatile(&ERROR);
+                if buffer.cmds_in_buffer > 0 {
+                    buffer.cmds_in_buffer -= 1;
+
+                    while let Some(now) = buffer.buffer.read() {
+                        buf[iter] = now;
+                        iter += 1;
+
+                        if now == '\n' as u8 {
+                            done = true;
+                            break
+                        }
+                    }
                 }
             }
         });
+
+        if done {
+            done = false;
+            for c in "Got command [length = ".as_bytes() {
+                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c));
+            }
+
+            for c in iter.numtoa(10, &mut tmp).iter() {
+                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c as u8));
+            }
+            nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), ']' as u8));
+            nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), ':' as u8));
+            nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), ' ' as u8));
+
+            for c in buf.iter().take(iter) {
+                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c));
+            }
+
+            iter = 0;
+        }
+
+
+        let mut error_code: u8 = 0;
+        unsafe {
+            error_code = read_volatile(&ERROR);
+        }
 
         if error_code > 0 {
             unsafe { write_volatile(&mut ERROR, 0); }
@@ -245,14 +298,6 @@ fn main() -> ! {
                 nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), c as u8));
             }
         }
-
-        match data {
-            Some(c) => {
-                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), c));
-            },
-            None => {}
-        }
-
     }
 }
 
@@ -270,7 +315,10 @@ fn USART1() {
         if let Ok(c) = read(stm32f0::stm32f0x1::USART1::ptr()) {
             cortex_m::interrupt::free(|cs| {
                 if let &mut Some(ref mut buffer) = RX_BUFFER.borrow(cs).borrow_mut().deref_mut() {
-                    buffer.push(c).unwrap();
+                    buffer.buffer.push(c).unwrap();
+                    if c == '\n' as u8 {
+                        buffer.cmds_in_buffer += 1;
+                    }
                 }
             });
         }
