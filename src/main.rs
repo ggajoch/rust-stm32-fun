@@ -10,6 +10,7 @@ use crate::hal::{prelude::*};
 use cortex_m::{interrupt::Mutex};
 use cortex_m_rt::{entry, exception};
 use core::fmt::Write;
+use cortex_m_semihosting::hprintln;
 
 use stm32f0::stm32f0x1::interrupt;
 
@@ -187,6 +188,8 @@ impl Device for Hardware {
         syst.enable_counter();
         syst.enable_interrupt();
 
+        hprintln!("Init done!").unwrap();
+
         Hardware {
             led,
             serial,
@@ -267,6 +270,7 @@ fn main() -> ! {
 
         if done {
             done = false;
+
             for c in "Got command [length = ".as_bytes() {
                 nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c));
             }
