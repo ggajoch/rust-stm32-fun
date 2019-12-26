@@ -1,7 +1,9 @@
 #![no_main]
 #![no_std]
+//#![feature(const_fn)]
 
-use panic_halt as _;
+//use panic_halt as _;
+use panic_semihosting as _;
 
 use stm32f0xx_hal as hal;
 
@@ -10,9 +12,10 @@ use crate::hal::{prelude::*};
 use cortex_m::{interrupt::Mutex};
 use cortex_m_rt::{entry, exception};
 use core::fmt::Write;
-use cortex_m_semihosting::hprintln;
+//use cortex_m_semihosting::hprintln;
 
 use stm32f0::stm32f0x1::interrupt;
+use stm32f0::stm32f0x1::Interrupt;
 
 use core::{cell::RefCell, ops::DerefMut};
 use core::ptr::{write_volatile, read_volatile};
@@ -20,6 +23,11 @@ use numtoa::NumToA;
 
 use nb::block;
 use nb::Error::WouldBlock;
+
+use rtfm;
+
+use heapless::{consts::U32, Vec};
+
 
 /// Tries to write a byte to the UART
 /// Fails if the transmit buffer is full
@@ -42,12 +50,15 @@ fn read(usart: *const hal::stm32::usart1::RegisterBlock) -> nb::Result<u8, hal::
     let isr = unsafe { (*usart).isr.read() };
 
     let err = if isr.pe().bit_is_set() {
+//        hprintln!("Parity");
         nb::Error::Other(hal::serial::Error::Parity)
     } else if isr.fe().bit_is_set() {
+//        hprintln!("Frame");
         nb::Error::Other(hal::serial::Error::Framing)
     } else if isr.nf().bit_is_set() {
         nb::Error::Other(hal::serial::Error::Noise)
     } else if isr.ore().bit_is_set() {
+//        hprintln!("Overrun");
         nb::Error::Other(hal::serial::Error::Overrun)
     } else if isr.rxne().bit_is_set() {
         // NOTE(read_volatile) see `write_volatile` below
@@ -175,9 +186,9 @@ impl Device for Hardware {
         let mut serial = hal::serial::Serial::usart1(p.USART1, (tx, rx), 115200.bps(), &mut rcc);
 
         serial.listen(hal::serial::Event::Rxne);
-        unsafe {
-            hal::stm32f0::stm32f0x1::NVIC::unmask(interrupt::USART1);
-        }
+//        unsafe {
+//            hal::stm32f0::stm32f0x1::NVIC::unmask(interrupt::USART1);
+//        }
 
         let mut syst = cp.SYST;
 
@@ -187,8 +198,6 @@ impl Device for Hardware {
         syst.set_reload(4_000_000);
         syst.enable_counter();
         syst.enable_interrupt();
-
-        hprintln!("Init done!").unwrap();
 
         Hardware {
             led,
@@ -219,11 +228,11 @@ static HARDWARE : Mutex<RefCell<Option<Hardware>>> = Mutex::new(RefCell::new(Non
 static RX_BUFFER : Mutex<RefCell<Option<CommandsBuffer>>> = Mutex::new(RefCell::new(None));
 
 static mut ERROR: u8 = 0_u8;
-
-//#[entry]
-#[no_mangle]
-fn main() -> ! {
-    let mut _rx_buf : *mut CommandsBuffer = core::ptr::null_mut();
+//
+////#[entry]
+//#[no_mangle]
+fn setup() {
+    let mut _rx_buf: *mut CommandsBuffer = core::ptr::null_mut();
 
     cortex_m::interrupt::free(|cs| {
         let mut hw = Hardware::new();
@@ -231,99 +240,219 @@ fn main() -> ! {
         hw.serial.write_str("Startup!\r\n");
         *HARDWARE.borrow(cs).borrow_mut() = Some(hw);
 
-        let mut rx_buf = CommandsBuffer{
-            buffer : Buffer::new(),
-            cmds_in_buffer : 0
+        let mut rx_buf = CommandsBuffer {
+            buffer: Buffer::new(),
+            cmds_in_buffer: 0
         };
         _rx_buf = &mut rx_buf;
 
         *RX_BUFFER.borrow(cs).borrow_mut() = Some(rx_buf);
     });
+}
+
+fn looping() {
 
 
 
-    let mut buf = [0_u8; 30];
-    let mut iter = 0_usize;
-    let mut done = false;
+    let mut error_code: u8 = 0;
+    unsafe {
+        error_code = read_volatile(&ERROR);
+    }
 
-    loop {
-        let mut tmp = [0_u8; 30];
+    if error_code > 0 {
+        unsafe { write_volatile(&mut ERROR, 0); }
 
-
-        cortex_m::interrupt::free(|cs| {
-            if let &mut Some(ref mut buffer) = RX_BUFFER.borrow(cs).borrow_mut().deref_mut() {
-                if buffer.cmds_in_buffer > 0 {
-                    buffer.cmds_in_buffer -= 1;
-
-                    while let Some(now) = buffer.buffer.read() {
-                        buf[iter] = now;
-                        iter += 1;
-
-                        if now == '\n' as u8 {
-                            done = true;
-                            break
-                        }
-                    }
-                }
-            }
-        });
-
-        if done {
-            done = false;
-
-            for c in "Got command [length = ".as_bytes() {
-                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c));
-            }
-
-            for c in iter.numtoa(10, &mut tmp).iter() {
-                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c as u8));
-            }
-            nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), ']' as u8));
-            nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), ':' as u8));
-            nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), ' ' as u8));
-
-            for c in buf.iter().take(iter) {
-                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c));
-            }
-
-            iter = 0;
-        }
-
-
-        let mut error_code: u8 = 0;
-        unsafe {
-            error_code = read_volatile(&ERROR);
-        }
-
-        if error_code > 0 {
-            unsafe { write_volatile(&mut ERROR, 0); }
-
-            for c in "err\r\n".chars() {
-                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), c as u8));
-            }
+        for c in "err\r\n".chars() {
+            nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), c as u8));
         }
     }
 }
 
-#[exception]
-fn SysTick() {
-    cortex_m::interrupt::free(|cs| {
-        if let &mut Some(ref mut hw) = HARDWARE.borrow(cs).borrow_mut().deref_mut() {
-            hw.led_toggle();
-        }
-    });
+fn dbgc(char : u8) {
+    nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), char));
 }
 
-#[interrupt]
-fn USART1() {
-        if let Ok(c) = read(stm32f0::stm32f0x1::USART1::ptr()) {
+fn dbg(text : &str) {
+    for c in text.bytes() {
+        nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), c));
+    }
+    nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), '\n' as u8));
+}
+
+#[rtfm::app(device=stm32f0::stm32f0x1)]
+const APP: () = {
+    struct Resources {
+        #[init(false)]
+        shared: bool,
+
+        #[init([0; 30])]
+        buffer: [u8; 30],
+
+        #[init(0)]
+        buf_index: usize,
+
+        #[init(Buffer::new())]
+        xxx: Buffer,
+    }
+
+
+
+
+    #[init]
+    fn init(cx: init::Context) {
+        setup();
+    }
+
+    #[task(resources = [shared])]
+    fn led_blink(cx: led_blink::Context) {
+        cortex_m::interrupt::free(|cs| {
+            if let &mut Some(ref mut hw) = HARDWARE.borrow(cs).borrow_mut().deref_mut() {
+                hw.led_toggle();
+            }
+        });
+    }
+
+
+    #[task(binds = SysTick, spawn = [led_blink])]
+    fn SysTick_handler(cx: SysTick_handler::Context) {
+        cx.spawn.led_blink().unwrap();
+    }
+
+    #[idle]
+    fn idle(cx: idle::Context) -> ! {
+        loop {
+            let mut buf = [0_u8; 30];
+            let mut iter = 0_usize;
+            let mut done = false;
+            let mut tmp = [0_u8; 30];
+
+
             cortex_m::interrupt::free(|cs| {
                 if let &mut Some(ref mut buffer) = RX_BUFFER.borrow(cs).borrow_mut().deref_mut() {
-                    buffer.buffer.push(c).unwrap();
-                    if c == '\n' as u8 {
-                        buffer.cmds_in_buffer += 1;
+                    if buffer.cmds_in_buffer > 0 {
+                        buffer.cmds_in_buffer -= 1;
+
+                        while let Some(now) = buffer.buffer.read() {
+                            buf[iter] = now;
+                            iter += 1;
+
+                            if now == '\n' as u8 {
+                                done = true;
+                                break
+                            }
+                        }
                     }
                 }
             });
+
+            if done {
+                done = false;
+
+                for c in "Got command [length = ".as_bytes() {
+                    nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c));
+                }
+
+                for c in iter.numtoa(10, &mut tmp).iter() {
+                    nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c as u8));
+                }
+                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), ']' as u8));
+                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), ':' as u8));
+                nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), ' ' as u8));
+
+                for c in buf.iter().take(iter) {
+                    nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c));
+                }
+
+                iter = 0;
+            }
         }
-}
+    }
+
+//    #[task(priority = 2, capacity = 5)]
+//    fn got_command(cx: got_command::Context, arr: [u8; 30]) {
+//        hprintln!("got");
+//        dbg("got_command");
+//        for c in arr.iter() {
+//            nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c as u8));
+//
+//            if *c == '\n' as u8 {
+//                break;
+//            }
+//        }
+//    }
+
+//    #[task(priority = 2, capacity = 5, resources = [buf])]
+//    fn got_command(cx: got_command::Context, arr: [u8; 32]) {
+//        hprintln!("got");
+//        dbg("got_command");
+//        for c in arr.iter() {
+//            nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), *c as u8));
+//
+//            if *c == '\n' as u8 {
+//                break;
+//            }
+//        }
+//    }
+
+    #[task(priority = 1)]
+    fn printx(cx: printx::Context) {
+        dbg("woah");
+//        hprintln!("woah");
+    }
+//
+//    #[task(priority = 1, capacity = 10/*, resources = [xxx]*/)]
+//    fn got_command(mut cx: got_command::Context, length: u8) {
+//        dbgc('Y' as u8);
+////        hprintln!("got {} ", length);
+//        dbg("got_command: ");
+//
+////        let mut buffer: Vec<u8, U32> = Vec(heapless::i::Vec::new());
+////
+////        cx.resources.xxx.lock(|buf| {
+////            loop {
+////                let now = buf.read().unwrap();
+////                buffer.push(now);
+////                if now == '\n' as u8 {
+////                    break;
+////                }
+////            }
+////        });
+//
+////        for c in buffer {
+////            dbgc(c);
+////        }
+//
+////        loop {
+////            cx.resources.buf.push(c);
+////            let now = cx.resources.buf.read().unwrap();
+////            dbg(now);
+////
+////            if now == '\n' as u8 {
+////                return;
+////            }
+////        }
+//
+//
+//    }
+
+    #[task(binds = USART1, spawn = [printx], priority = 3)]
+    fn USART1_handler(cx: USART1_handler::Context) {
+        if let Ok(c) = read(stm32f0::stm32f0x1::USART1::ptr()) {
+//            cx.resources.xxx.push(c);
+            if c == '\n' as u8 {
+                cx.spawn.printx().unwrap();
+                dbg("X");
+            }
+        } else {
+//            dbg("error!");
+        }
+    }
+
+    extern "C" {
+        fn USART2();
+        fn SPI2();
+    }
+};
+
+
+
