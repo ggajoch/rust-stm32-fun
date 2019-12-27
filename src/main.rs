@@ -7,6 +7,63 @@ use crate::hal::{prelude::*};
 use stm32f0;
 use rtfm;
 
+#[rtfm::app(device=crate::hal::stm32f0::stm32f0x1, peripherals = true)]
+const APP: () = {
+    #[init]
+    fn init(cx: init::Context) {
+        let mut p = cx.device;
+        let mut rcc = p.RCC.configure().sysclk(8.mhz()).freeze(&mut p.FLASH);
+
+        let gpioa = p.GPIOA.split(&mut rcc);
+
+        let (tx, rx) = cortex_m::interrupt::free(|cs| {
+            (gpioa.pa9.into_alternate_af1(cs),
+             gpioa.pa10.into_alternate_af1(cs))
+        });
+
+
+        let mut serial = hal::serial::Serial::usart1(p.USART1, (tx, rx), 115200.bps(), &mut rcc);
+
+        serial.listen(hal::serial::Event::Rxne);
+    }
+
+    #[task(priority = 1, capacity = 10)]
+    fn time_consuming_task(_: time_consuming_task::Context) {
+        print("time consuming task");
+    }
+
+//    #[task(priority = 2)]
+//    fn printx2(_: printx2::Context) {
+//    }
+
+    #[task(priority = 8, binds = USART1, spawn = [time_consuming_task])]
+    fn usart_handler(_cx: usart_handler::Context) {
+        match read(stm32f0::stm32f0x1::USART1::ptr()) {
+            Ok(_c) => {
+                _cx.spawn.time_consuming_task().unwrap();
+            }
+            Err(_e) => {
+                print("error!");
+            }
+        }
+    }
+
+    extern "C" {
+        fn DMA1_CH1();
+        fn TSC();
+    }
+};
+
+
+fn print(text : &str) {
+    for c in text.bytes() {
+        nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), c)).unwrap();
+    }
+    nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), '\n' as u8)).unwrap();
+}
+
+
+
 
 /// Tries to write a byte to the UART
 /// Fails if the transmit buffer is full
@@ -59,60 +116,3 @@ fn read(usart: *const hal::stm32::usart1::RegisterBlock) -> nb::Result<u8, hal::
 
     Err(err)
 }
-
-fn print(text : &str) {
-    for c in text.bytes() {
-        nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), c)).unwrap();
-    }
-    nb::block!(write(stm32f0::stm32f0x1::USART1::ptr(), '\n' as u8)).unwrap();
-}
-
-#[rtfm::app(device=crate::hal::stm32f0::stm32f0x1, peripherals = true)]
-const APP: () = {
-    #[init]
-    fn init(cx: init::Context) {
-        let mut p = cx.device;
-        let mut rcc = p.RCC.configure().sysclk(8.mhz()).freeze(&mut p.FLASH);
-
-        let gpioa = p.GPIOA.split(&mut rcc);
-
-        let (tx, rx) = cortex_m::interrupt::free(|cs| {
-            (gpioa.pa9.into_alternate_af1(cs),
-             gpioa.pa10.into_alternate_af1(cs))
-        });
-
-
-        let mut serial = hal::serial::Serial::usart1(p.USART1, (tx, rx), 115200.bps(), &mut rcc);
-
-        serial.listen(hal::serial::Event::Rxne);
-    }
-
-    #[task(priority = 1, capacity = 10)]
-    fn time_consuming_task(_: time_consuming_task::Context) {
-        print("time consuming task");
-    }
-
-//    #[task(priority = 2)]
-//    fn printx2(_: printx2::Context) {
-//    }
-
-    #[task(priority = 8, binds = USART1, spawn = [time_consuming_task])]
-    fn usart_handler(_cx: usart_handler::Context) {
-        match read(stm32f0::stm32f0x1::USART1::ptr()) {
-            Ok(_c) => {
-                _cx.spawn.time_consuming_task().unwrap();
-            }
-            Err(_e) => {
-                print("error!");
-            }
-        }
-    }
-
-    extern "C" {
-        fn TSC();
-        fn DMA1_CH1();
-    }
-};
-
-
-
