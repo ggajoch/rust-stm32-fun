@@ -2,41 +2,46 @@
 #![no_std]
 
 use panic_halt as _;
-use stm32f0xx_hal as hal;
-use crate::hal::{prelude::*};
 use stm32f0;
 use rtfm;
 
-#[rtfm::app(device=crate::hal::stm32f0::stm32f0x1, peripherals = true)]
+#[rtfm::app(device=stm32f0::stm32f0x1, peripherals = true)]
 const APP: () = {
     #[init]
-    fn init(cx: init::Context) {
-        let mut p = cx.device;
-        let mut rcc = p.RCC.configure().sysclk(8.mhz()).freeze(&mut p.FLASH);
+    fn init(_cx: init::Context) {
+        unsafe {
+            (*stm32f0::stm32f0x1::RCC::ptr()).ahbenr.modify(|_, w| w.iopaen().set_bit());
 
-        let gpioa = p.GPIOA.split(&mut rcc);
+            _set_alternate_mode(9, 1);
+            _set_alternate_mode(10, 1);
+            (*stm32f0::stm32f0x1::GPIOA::ptr()).afrl.modify(|_, w| w.afrl0().af9());
+            (*stm32f0::stm32f0x1::GPIOA::ptr()).afrl.modify(|_, w| w.afrl0().af10());
 
-        let (tx, rx) = cortex_m::interrupt::free(|cs| {
-            (gpioa.pa9.into_alternate_af1(cs),
-             gpioa.pa10.into_alternate_af1(cs))
-        });
+            (*stm32f0::stm32f0x1::RCC::ptr()).apb2enr.modify(|_, w| w.usart1en().set_bit());
+            (*stm32f0::stm32f0x1::USART1::ptr()).cr1.modify(|_, w| w.ue().clear_bit());
+            (*stm32f0::stm32f0x1::USART1::ptr()).brr.modify(|_, w| w.bits(8000000/115200));
 
+            (*stm32f0::stm32f0x1::USART1::ptr()).cr2.reset();
+            (*stm32f0::stm32f0x1::USART1::ptr()).cr3.reset();
 
-        let mut serial = hal::serial::Serial::usart1(p.USART1, (tx, rx), 115200.bps(), &mut rcc);
+            (*stm32f0::stm32f0x1::USART1::ptr()).cr1.modify(|_, w| w.te().set_bit().re().set_bit().ue().set_bit());
 
-        serial.listen(hal::serial::Event::Rxne);
+            (*stm32f0::stm32f0x1::USART1::ptr()).cr1.modify(|_, w| w.rxneie().set_bit());
+        }
+
+        print("init done.");
     }
 
-    #[task(priority = 1, capacity = 10)]
+    #[task(priority = 2, capacity = 10)]
     fn time_consuming_task(_: time_consuming_task::Context) {
         print("time consuming task");
     }
 
-//    #[task(priority = 2)]
+//    #[task(priority = 3)]
 //    fn printx2(_: printx2::Context) {
 //    }
 
-    #[task(priority = 8, binds = USART1, spawn = [time_consuming_task])]
+    #[task(priority = 4, binds = USART1, spawn = [time_consuming_task])]
     fn usart_handler(_cx: usart_handler::Context) {
         match read(stm32f0::stm32f0x1::USART1::ptr()) {
             Ok(_c) => {
@@ -67,7 +72,7 @@ fn print(text : &str) {
 
 /// Tries to write a byte to the UART
 /// Fails if the transmit buffer is full
-fn write(usart: *const hal::stm32::usart1::RegisterBlock, byte: u8) -> nb::Result<(), ()> {
+fn write(usart: *const stm32f0::stm32f0x1::usart1::RegisterBlock, byte: u8) -> nb::Result<(), ()> {
     // NOTE(unsafe) atomic read with no side effects
     let isr = unsafe { (*usart).isr.read() };
 
@@ -81,18 +86,18 @@ fn write(usart: *const hal::stm32::usart1::RegisterBlock, byte: u8) -> nb::Resul
     }
 }
 /// Tries to read a byte from the UART
-fn read(usart: *const hal::stm32::usart1::RegisterBlock) -> nb::Result<u8, hal::serial::Error> {
+fn read(usart: *const stm32f0::stm32f0x1::usart1::RegisterBlock) -> nb::Result<u8, u8> {
     // NOTE(unsafe) atomic read with no side effects
     let isr = unsafe { (*usart).isr.read() };
 
     let err = if isr.pe().bit_is_set() {
-        nb::Error::Other(hal::serial::Error::Parity)
+        nb::Error::Other(0)
     } else if isr.fe().bit_is_set() {
-        nb::Error::Other(hal::serial::Error::Framing)
+        nb::Error::Other(1)
     } else if isr.nf().bit_is_set() {
-        nb::Error::Other(hal::serial::Error::Noise)
+        nb::Error::Other(2)
     } else if isr.ore().bit_is_set() {
-        nb::Error::Other(hal::serial::Error::Overrun)
+        nb::Error::Other(3)
     } else if isr.rxne().bit_is_set() {
         // NOTE(read_volatile) see `write_volatile` below
         return Ok(unsafe { core::ptr::read_volatile(&(*usart).rdr as *const _ as *const _) });
@@ -115,4 +120,26 @@ fn read(usart: *const hal::stm32::usart1::RegisterBlock) -> nb::Result<u8, hal::
     };
 
     Err(err)
+}
+
+fn _set_alternate_mode (index:usize, mode: u32)
+{
+    let offset = 2 * index;
+    let offset2 = 4 * index;
+    unsafe {
+        let reg = &(*stm32f0::stm32f0x1::GPIOA::ptr());
+        if offset2 < 32 {
+            reg.afrl.modify(|r, w| {
+                w.bits((r.bits() & !(0b1111 << offset2)) | (mode << offset2))
+            });
+        } else {
+            let offset2 = offset2 - 32;
+            reg.afrh.modify(|r, w| {
+                w.bits((r.bits() & !(0b1111 << offset2)) | (mode << offset2))
+            });
+        }
+        reg.moder.modify(|r, w| {
+            w.bits((r.bits() & !(0b11 << offset)) | (0b10 << offset))
+        });
+    }
 }
