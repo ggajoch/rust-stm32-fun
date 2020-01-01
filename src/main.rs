@@ -37,10 +37,6 @@ const APP: () = {
         print("time consuming task");
     }
 
-//    #[task(priority = 3)]
-//    fn printx2(_: printx2::Context) {
-//    }
-
     #[task(priority = 4, binds = USART1, spawn = [time_consuming_task])]
     fn usart_handler(_cx: usart_handler::Context) {
         match read(stm32f0::stm32f0x1::USART1::ptr()) {
@@ -55,7 +51,6 @@ const APP: () = {
 
     extern "C" {
         fn DMA1_CH1();
-        fn TSC();
     }
 };
 
